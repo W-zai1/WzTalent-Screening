@@ -103,6 +103,22 @@ jobs:
         working-directory: tests
         run: python test_identity_batch.py
 
+      - name: 事件按 ID 关联（同名候选人不串台）
+        working-directory: tests
+        run: python test_event_identity.py
+
+      - name: 事件归一化字段（stage / duration_ms / error_type）
+        working-directory: tests
+        run: python test_event_stage.py
+
+      - name: 合成样本集自洽 + 超长材料截断策略
+        working-directory: tests
+        run: python test_sampleset.py
+
+      - name: 评测判定规则（不经模型验证规则本身）
+        working-directory: tests
+        run: python test_eval_rules.py
+
       - name: 评审追加历史（migration 7）
         working-directory: tests
         run: python test_evaluations.py

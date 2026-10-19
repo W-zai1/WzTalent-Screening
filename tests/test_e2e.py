@@ -57,6 +57,21 @@ def fake_raw(messages, model, api_key, base_url, temperature, use_json, timeout)
     elif "裁定裁判" in sysp:
         t = '{"pro_evidence":["8年后端"],"con_challenges":["无带团队证据"],' \
             '"disputes":["是否真的带过团队"],"excluded":["自称主导过架构"]}'
+    elif "转录分析" in sysp:
+        # P1 说话人归属：按段文本判（问句/点名面试官 → 面试官）
+        import re as _re
+        items = []
+        for m in _re.finditer(r"【(\d+)】([^\n]+)", messages[-1]["content"]):
+            idx, txt = int(m.group(1)), m.group(2)
+            if ("面试官" in txt or "？" in txt or "?" in txt
+                    or "今天就到这里" in txt):
+                sp, conf = "interviewer", 0.93
+            else:
+                sp, conf = "candidate", 0.88
+            items.append({"idx": idx, "speaker": sp, "confidence": conf,
+                          "reason": "提问或推进流程" if sp == "interviewer" else "自述经历",
+                          "asker": ""})
+        t = json.dumps({"segments": items}, ensure_ascii=False)
     elif "面试官" in sysp:
         t = '{"questions":[{"q":"你带过几个人的团队？","intent":"核实",' \
             '"why":"争议点：是否真带过团队","probe":"追问汇报关系与人数"}]}'
@@ -247,11 +262,28 @@ check("确认后待确认列表清空", len(b.get("pending_identity") or []) == 
 
 # ============================================================ P0-2 评审 / SSE
 section("P0-2 评审互斥 / 取消 / SSE 断点续传")
-s, b = call("POST", "/api/jobs/%s/run" % jid, API)
-check("启动评审", s == 200 and b["run"]["id"], b)
-rid = b["run"]["id"]
-s, b = call("POST", "/api/jobs/%s/run" % jid, API)
-check("重复启动被拒 409（运行互斥）", s == 409, (s, b))
+# 互斥检查对时序敏感：桩 LLM 太快，5 个候选人的运行可能在两次 POST
+# 之间就跑完（全套跑时 CPU 争抢会放大这个 race，表现为随机 200）。
+# 延迟 spawn 让"运行中"窗口确定可见——测的是互斥逻辑，不是手速。
+import jobs_runner as _jr
+import time as _time
+_orig_spawn = _jr.spawn
+
+
+def _delayed_spawn(run_id, api):
+    _time.sleep(1.5)
+    return _orig_spawn(run_id, api)
+
+
+_jr.spawn = _delayed_spawn
+try:
+    s, b = call("POST", "/api/jobs/%s/run" % jid, API)
+    check("启动评审", s == 200 and b["run"]["id"], b)
+    rid = b["run"]["id"]
+    s, b = call("POST", "/api/jobs/%s/run" % jid, API)
+    check("重复启动被拒 409（运行互斥）", s == 409, (s, b))
+finally:
+    _jr.spawn = _orig_spawn
 
 events = []
 req = urllib.request.Request(BASE + "/api/runs/%s/stream?after=0" % rid)
@@ -405,6 +437,215 @@ check("过期清理可预览（dry-run）", s == 200, b)
 
 s, b = call("GET", "/api/privacy/export/%s" % pid)
 check("个人数据可导出（PIPL 第45条）", s == 200 and (b.get("ok") or b.get("person") or b.get("data")), list(b.keys()))
+
+
+# ============================================================ P0-5 音频上传（ASR）
+section("P0-5 音频上传：转写稿按 transcript 入库，失败走 errors 通道")
+
+import audio_ingest as _ai_mod
+_orig_transcribe_audio = _ai_mod.transcribe_audio
+_FAKE_ASR = {
+    "text": "面试官：请讲讲你做过的高并发系统。\n候选人：我在上一家公司负责支付网关，QPS 峰值两万。",
+    "warnings": [], "engine": "whisper", "duration_sec": 1830.5, "language": "zh",
+    "segments": [{"start": 0.0, "end": 4.2, "text": "面试官：请讲讲你做过的高并发系统。"},
+                 {"start": 4.5, "end": 22.8, "text": "候选人：我在上一家公司负责支付网关，QPS 峰值两万。"}],
+}
+
+
+def _fake_transcribe(fname, data, engine=None):
+    return dict(_FAKE_ASR)
+
+
+_ai_mod.transcribe_audio = _fake_transcribe
+try:
+    # 音频 + 简历同批上传：音频走 ASR 桥接按 transcript 入库，不阻断简历
+    s, b = call("POST", "/api/jobs/%s/candidates" % jid, {"candidates": [{"name": "孙七", "files": [
+        {"filename": "一面录音.mp3", "role": "transcript",
+         "data_base64": base64.b64encode(b"FAKE-AUDIO-BYTES").decode()},
+        {"filename": "sun7.txt", "role": "resume",
+         "data_base64": base64.b64encode("孙七\n五年后端\n手机：13700000001".encode()).decode()}]}]})
+    a7 = (b.get("added") or [{}])[0]
+    check("音频+简历同批上传成功", s == 200 and a7.get("id"), (s, b))
+    cands = b.get("candidates") or []
+    c7 = next((c for c in cands if c.get("name") == "孙七"), {})
+    check("音频转写稿写入 transcript_text",
+          "QPS 峰值两万" in (c7.get("transcript_text") or ""), c7.get("transcript_text"))
+    kinds = {f["filename"]: (f["role"], f["kind"]) for f in (c7.get("files") or [])}
+    check("音频文件按 transcript/asr-transcript 存档",
+          kinds.get("一面录音.mp3") == ("transcript", "asr-transcript"), kinds)
+    check("同批简历不受音频影响", "五年后端" in (c7.get("resume_text") or ""))
+
+    # 未显式给 role：靠文件名猜（面试录音 → transcript）
+    s, b = call("POST", "/api/jobs/%s/candidates" % jid, {"candidates": [{"name": "周八", "files": [
+        {"filename": "二面录音.mp3",
+         "data_base64": base64.b64encode(b"FAKE-AUDIO-BYTES").decode()}]}]})
+    c8 = next((c for c in (b.get("candidates") or []) if c.get("name") == "周八"), {})
+    check("无 role 时按文件名猜中 transcript",
+          "QPS 峰值两万" in (c8.get("transcript_text") or ""), c8.get("transcript_text"))
+
+    # 不支持的音频格式：明确报错，不静默丢弃
+    s, b = call("POST", "/api/jobs/%s/candidates" % jid, {"candidates": [{"name": "吴九", "files": [
+        {"filename": "坏文件.aac",
+         "data_base64": base64.b64encode(b"FAKE").decode()}]}]})
+    check("不支持的音频格式有明确错误",
+          s == 200 and not (b.get("added") or [])
+          and any("不支持" in e for e in (b.get("errors") or [])), b.get("errors"))
+finally:
+    _ai_mod.transcribe_audio = _orig_transcribe_audio
+
+# 转写失败（未装 faster-whisper / 引擎未配置）：进 errors，不造假稿
+def _fail_transcribe(fname, data, engine=None):
+    from docparse import ParseError
+    raise ParseError("%s：未配置 ASR 引擎，无法转写音频" % fname)
+
+
+_ai_mod.transcribe_audio = _fail_transcribe
+try:
+    s, b = call("POST", "/api/jobs/%s/candidates" % jid, {"candidates": [{"name": "郑十", "files": [
+        {"filename": "转写失败的录音.mp3",
+         "data_base64": base64.b64encode(b"FAKE-AUDIO-BYTES").decode()},
+        {"filename": "zheng10.txt", "role": "resume",
+         "data_base64": base64.b64encode("郑十\n三年经验".encode()).decode()}]}]})
+    check("转写失败进 errors 通道", s == 200
+          and any("未配置 ASR 引擎" in e for e in (b.get("errors") or [])), b.get("errors"))
+    check("转写失败不阻断同批简历",
+          any(c.get("name") == "郑十" for c in (b.get("candidates") or [])))
+    c10 = next((c for c in (b.get("candidates") or []) if c.get("name") == "郑十"), {})
+    check("转写失败的音频不产生假 transcript_text",
+          not (c10.get("transcript_text") or "").strip(), c10.get("transcript_text"))
+finally:
+    _ai_mod.transcribe_audio = _orig_transcribe_audio
+
+
+# ============================================================ P1 说话人归属与问答配对
+section("P1-1 说话人归属：段落入库 → 归属 → 人工修正 → 重跑保留 → 问答配对")
+
+import audio_ingest as _ai_mod3
+_orig_ta3 = _ai_mod3.transcribe_audio
+
+
+def _seg_asr(fname, data, engine=None):
+    """四段对白（两问两答）+ 段级时间戳：真实 ASR 的产出形态。"""
+    return {
+        "text": "面试官：请讲讲你做过的高并发系统。\n候选人：我在上一家公司负责支付网关，QPS 峰值两万。\n面试官：遇到过什么故障？\n候选人：数据库主从延迟，我改了读请求的路由策略。",
+        "warnings": [], "engine": "whisper", "duration_sec": 120.0, "language": "zh",
+        "segments": [
+            {"start": 0.0, "end": 4.2, "text": "面试官：请讲讲你做过的高并发系统。"},
+            {"start": 4.5, "end": 22.8, "text": "候选人：我在上一家公司负责支付网关，QPS 峰值两万。"},
+            {"start": 23.0, "end": 26.0, "text": "面试官：遇到过什么故障？"},
+            {"start": 26.5, "end": 41.0, "text": "候选人：数据库主从延迟，我改了读请求的路由策略。"},
+        ],
+    }
+
+
+_ai_mod3.transcribe_audio = _seg_asr
+try:
+    s, b = call("POST", "/api/jobs/%s/candidates" % jid, {"candidates": [{"name": "钱十一", "files": [
+        {"filename": "三面录音.mp3", "role": "transcript",
+         "data_base64": base64.b64encode(b"FAKE-AUDIO-BYTES").decode()},
+        {"filename": "qian11.txt", "role": "resume",
+         "data_base64": base64.b64encode("钱十一\n五年后端\n手机：13800000011".encode()).decode()}]}]})
+    c11 = next((c for c in (b.get("candidates") or []) if c.get("name") == "钱十一"), {})
+    cid = c11.get("id")
+    check("带段时间戳的音频上传成功", s == 200 and cid, (s, b))
+
+    # 1) 段随音频落库，但不预判归属
+    s, b = call("GET", "/api/candidates/%s/diarization" % cid)
+    check("段随音频落库（4 段）", s == 200 and len(b.get("segments") or []) == 4, (s, b))
+    check("入库不预判归属（全 unassigned）",
+          all(x["speaker"] == "unassigned" for x in (b.get("segments") or [])))
+    check("段带时间戳", (b["segments"][0]["start"], b["segments"][0]["end"]) == (0.0, 4.2))
+
+    # 2) 跑归属（LLM 桩：问句 → 面试官）
+    s, b = call("POST", "/api/candidates/%s/diarize" % cid, API)
+    sp = [x["speaker"] for x in (b.get("segments") or [])]
+    check("归属：两问两答分离正确",
+          s == 200 and sp == ["interviewer", "candidate", "interviewer", "candidate"], (s, b))
+    check("覆盖率 100%", (b.get("stats") or {}).get("coverage") == 1.0, b.get("stats"))
+    check("每段带判定理由", all(x["reason"] for x in (b.get("segments") or [])))
+
+    # 3) 人工修正（层 3）：把第一答标成"听不清"
+    s, b = call("PUT", "/api/candidates/%s/segments/1" % cid,
+                {"speaker": "unassigned", "reason": "现场听不清"})
+    check("人工修正被接受", s == 200, (s, b))
+    s, b = call("GET", "/api/candidates/%s/diarization" % cid)
+    seg1 = next(x for x in b["segments"] if x["idx"] == 1)
+    check("修正落库：source=manual / confidence=1.0",
+          seg1["source"] == "manual" and seg1["confidence"] == 1.0, seg1)
+    check("覆盖率随修正下降（3/4）", b["stats"]["coverage"] == 0.75, b["stats"])
+
+    # 4) 重跑归属：人工修正不被覆盖，引擎段重新推导
+    s, b = call("POST", "/api/candidates/%s/diarize" % cid, API)
+    seg1 = next(x for x in b["segments"] if x["idx"] == 1)
+    check("重跑保留人工修正（manual_kept=1）",
+          (b.get("saved") or {}).get("manual_kept") == 1
+          and seg1["source"] == "manual" and seg1["speaker"] == "unassigned",
+          (b.get("saved"), seg1))
+
+    # 5) 问答配对（问题清单经 store 写入，模拟 interview.py 的产出）
+    import store as _store
+    _store.update_candidate(cid, {"interview": {"questions": [
+        {"q": "请讲讲你做过的高并发系统？", "intent": "深挖", "why": "争议点"},
+        {"q": "遇到过什么故障？", "intent": "核实", "why": "被剔除论断"},
+        {"q": "你对我们公司有什么了解？", "intent": "核实", "why": "动机核验"},
+    ]}})
+    s, b = call("GET", "/api/candidates/%s/qa-pairing" % cid)
+    st = b.get("stats") or {}
+    byq = {p["question"]: p for p in (b.get("pairs") or [])}
+    check("配对：回答段被人工置未确认后，该问降级'问了没答'（不拿没搞清的话当回答）",
+          byq.get("请讲讲你做过的高并发系统？", {}).get("status") == "asked_dodged",
+          byq.get("请讲讲你做过的高并发系统？"))
+    check("配对：问了且答了 = 1，回答内容挂得上",
+          byq.get("遇到过什么故障？", {}).get("status") == "asked_answered"
+          and "主从延迟" in (byq.get("遇到过什么故障？", {}).get("answer") or ""),
+          byq.get("遇到过什么故障？"))
+    check("配对：没问的问题注明归属面试官",
+          byq.get("你对我们公司有什么了解？", {}).get("status") == "not_asked"
+          and "面试官" in (byq.get("你对我们公司有什么了解？", {}).get("attribution") or ""))
+    check("配对统计口径", (st.get("questions"), st.get("asked_answered"),
+                       st.get("asked_dodged"), st.get("not_asked")) == (3, 1, 1, 1), st)
+
+    # 6) 层 1 通过 HTTP 生效：问题清单已在，重跑应命中文本对齐
+    s, b = call("POST", "/api/candidates/%s/diarize" % cid, API)
+    seg0 = next(x for x in b["segments"] if x["idx"] == 0)
+    check("有问题清单后层 1 命中（reason 提及面试通知）",
+          seg0["speaker"] == "interviewer" and "面试通知" in seg0["reason"], seg0)
+
+    # 7) 错误路径
+    s, b = call("POST", "/api/jobs/%s/candidates" % jid, {"candidates": [{"name": "陈十一", "files": [
+        {"filename": "chen11.txt", "role": "resume",
+         "data_base64": base64.b64encode("陈十一\n三年经验".encode()).decode()}]}]})
+    c12 = next((c for c in (b.get("candidates") or []) if c.get("name") == "陈十一"), {})
+    s, b = call("POST", "/api/candidates/%s/diarize" % c12.get("id", "x"), {})
+    check("没有转写稿时明确报错", s == 400 and "转写稿" in (b.get("error") or ""), (s, b))
+    s, b = call("PUT", "/api/candidates/%s/segments/1" % cid, {"speaker": "面试官"})
+    check("非法 speaker 被 400 拒绝", s == 400, (s, b))
+    s, b = call("PUT", "/api/candidates/%s/segments/99" % cid, {"speaker": "candidate"})
+    check("不存在的段号 404", s == 404, (s, b))
+    s, b = call("GET", "/api/candidates/%s/qa-pairing" % c12.get("id", "x"))
+    check("没有段时配对明确报错", s == 400, (s, b))
+
+    # 8) LLM 失败：502，且不落假归属
+    import llm_client as _llm
+    _orig_raw = _llm._raw_completion
+
+    def _boom(*a, **kw):
+        raise _llm.LLMError("模型网关 500")
+
+    _llm._raw_completion = _boom
+    try:
+        s, b = call("POST", "/api/candidates/%s/diarize" % cid, API)
+        check("归属失败 502 且错误可读",
+              s == 502 and "说话人归属失败" in (b.get("error") or ""), (s, b))
+    finally:
+        _llm._raw_completion = _orig_raw
+    s, b = call("GET", "/api/candidates/%s/diarization" % cid)
+    check("归属失败后段库未被污染（仍是上次成功的结果）",
+          len(b.get("segments") or []) == 4
+          and next(x for x in b["segments"] if x["idx"] == 1)["source"] == "manual",
+          len(b.get("segments") or []))
+finally:
+    _ai_mod3.transcribe_audio = _orig_ta3
 
 
 # ============================================================ 汇总

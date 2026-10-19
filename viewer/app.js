@@ -1106,8 +1106,17 @@ function uncertaintyHtml(res) {
   }
   const cb = res.audit && res.audit.context_budget;
   if (res.audit && res.audit.context_truncated && cb) {
+    // 区分两件事，否则用户会以为"整份材料都没读到"：
+    //   truncated_sections  = 材料内部被截（头尾保留了，中间省略）
+    //   dropped_sections    = 整段没装进去
+    const iCut = cb.truncated_sections || [];
+    const iDrop = cb.dropped_sections || [];
+    const detail = [
+      iCut.length ? `${esc(iCut.join("、"))} 保留了头尾、省略中段` : "",
+      iDrop.length ? `${esc(iDrop.join("、"))} 完全没有装入` : "",
+    ].filter(Boolean).join("；");
     bits.push(`<span class="unc-warn">材料超长已截断（约 ${esc(cb.original_tokens)} →
-      ${esc(cb.final_tokens)} token，丢弃：${esc((cb.dropped_sections || []).join("、") || "无")}）。
+      ${esc(cb.final_tokens)} token${detail ? "，" + detail : ""}）。
       结论只对<b>被读到的那部分材料</b>成立。</span>`);
   }
   if (!bits.length) return "";
@@ -1325,9 +1334,15 @@ async function startRun() {
 const BUBBLE_RENDER_MS = 100;
 
 function bubbleKey(ev) {
-  // 必须带上候选人：3~5 路并发时，不同候选人的 pro_open 是同一个 key，
-  // 只用 key 会让后一个人的发言覆盖前一个人的气泡（曾经就是这样）。
-  return (ev.candidate || "") + "::" + (ev.key || "");
+  // 用 candidate_id，不能用姓名。两个理由：
+  // ① 3~5 路并发时，不同候选人的 pro_open 是同一个 key，只用 key 会让
+  //    后一个人的发言覆盖前一个人的气泡（曾经就是这样）；
+  // ② 即使把姓名拼上也还不够——同一个岗位下出现两个「张伟」是真实存在的
+  //    （identity 模块专门处理同名，align 报告层甚至拒绝按姓名回退匹配）。
+  //    存储层按 ID，展示层也必须按 ID，否则两块逻辑自相矛盾。
+  // 旧事件/旧库里没有 candidate_id 时回退到姓名，保证历史数据仍能显示。
+  const who = ev.candidate_id || ev.candidate || "";
+  return who + "::" + (ev.key || "");
 }
 
 function findBubble(feed, ev) {
@@ -2518,7 +2533,10 @@ function onUpFilesPicked(input) {
 function renderFileList(elId, list, storeKey) {
   $(elId).innerHTML = list.map((f, i) => {
     const kb = Math.round((f.size || 0) / 1024);
-    const role = f.role === "assessment" ? "测评" : f.role === "transcript" ? "转写" : "简历";
+    const isAudio = /\.(mp3|wav|m4a|mp4|ogg|webm)$/i.test(f.filename || "");
+    const role = f.role === "assessment" ? "测评"
+      : isAudio ? "录音"
+      : f.role === "transcript" ? "转写" : "简历";
     return `<div class="file-row">
       <span class="fname">${esc(f.filename)}</span>
       <span class="fmeta">${role} · ${kb}KB</span>
@@ -2550,6 +2568,7 @@ function guessRole(name) {
   const low = (name || "").toLowerCase();
   if (/测评|评测|笔试|机试|assessment|test|exam|logic/.test(low)) return "assessment";
   if (/转写|面试|逐字稿|transcript|interview/.test(low)) return "transcript";
+  if (/\.(mp3|wav|m4a|mp4|ogg|webm)$/.test(low)) return "transcript";  // 录音的内容就是转写稿
   return "resume";
 }
 

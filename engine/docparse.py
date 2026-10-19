@@ -24,6 +24,9 @@ TEXT_EXTS = {".txt", ".md", ".markdown", ".json", ".csv", ".log"}
 DOCX_EXTS = {".docx"}
 PDF_EXTS = {".pdf"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+# 音频/视频容器：不走文本抽取，走 asr-transcribe skill 转写（见 audio_ingest）。
+# 与 ingest.py 的音频分支、api.py 的上传分支共用同一份名单。
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".mp4", ".webm"}
 SUPPORTED_EXTS = TEXT_EXTS | DOCX_EXTS | PDF_EXTS | IMAGE_EXTS
 
 MAX_CHARS = 60000  # 单份文档的抽取上限，防止一份超长 PDF 把上下文撑爆
@@ -372,4 +375,4 @@ def parse_path(path, use_vision=True):
 
 
 def is_supported(filename):
-    return os.path.splitext(filename or "")[1].lower() in SUPPORTED_EXTS
+    return os.path.splitext(filename or "")[1].lower() in (SUPPORTED_EXTS | AUDIO_EXTS)

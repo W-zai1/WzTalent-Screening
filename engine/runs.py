@@ -27,6 +27,7 @@ import threading
 
 import audit
 import db
+import events
 
 # 进程内事件广播（跨线程唤醒 SSE 连接）；持久化在 run_events 里
 _subscribers = {}
@@ -241,6 +242,11 @@ def emit(run_id, event):
     """
     if event.get("ephemeral"):
         return emit_delta(run_id, event)
+
+    # 归一化字段（stage / duration_ms / error_type）在落库前补上：
+    # 这样断点重放出来的事件也带这些字段，而不是只有实时广播的那份才有。
+    # 只在内存里记账，不额外写库（见 events.py 的说明）。
+    event = events.annotate(run_id, event)
 
     conn = db.connect()
     with db.tx(conn) as c:

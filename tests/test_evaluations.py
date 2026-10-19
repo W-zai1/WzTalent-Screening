@@ -27,9 +27,9 @@ def check(name, ok, detail=""):
 db.init()
 conn = db.connect()
 print("schema_version =", db.SCHEMA_VERSION)
-check("迁移到 v7", db.SCHEMA_VERSION == 7)
+check("迁移到 v8", db.SCHEMA_VERSION == 8)
 ver = conn.execute("SELECT MAX(version) v FROM schema_migrations").fetchone()["v"]
-check("schema_migrations 记录到 7", ver == 7, ver)
+check("schema_migrations 记录到 8", ver == 8, ver)
 
 tables = {r["name"] for r in conn.execute(
     "SELECT name FROM sqlite_master WHERE type='table'")}

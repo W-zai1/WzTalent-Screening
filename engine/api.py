@@ -32,6 +32,7 @@ import store
 import talent
 import usage
 from docparse import SUPPORTED_EXTS, ParseError, is_supported, parse_bytes
+import audio_ingest
 from http_base import ApiError
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ from http_base import ApiError
 RESUME_HINTS = ("简历", "resume", "cv", "履历")
 ASSESS_HINTS = ("测评", "评测", "笔试", "机试", "assessment", "test", "exam", "logic")
 TRANSCRIPT_HINTS = ("转写", "面试", "逐字稿", "transcript", "interview")
+AUDIO_HINTS = ("录音", "音频", "视频", "audio", "video", "record")
 
 
 def guess_role(filename):
@@ -47,6 +49,8 @@ def guess_role(filename):
     low = (filename or "").lower()
     if any(h in low for h in TRANSCRIPT_HINTS):
         return "transcript"
+    if any(h in low for h in AUDIO_HINTS):
+        return "transcript"  # 音频的内容就是转写稿，角色唯一
     if any(h in low for h in ASSESS_HINTS):
         return "assessment"
     if any(h in low for h in RESUME_HINTS):
@@ -479,14 +483,29 @@ def h_upload(ctx):
             role = (f.get("role") or "").strip() or guess_role(fname)
             if role not in by_role:
                 role = "resume"
-            try:
-                parsed = parse_bytes(fname, data)
-            except ParseError as e:
-                errors.append("%s：%s" % (fname, e))
-                continue
-            except Exception as e:
-                errors.append("%s：解析异常 %s" % (fname, e))
-                continue
+            if audio_ingest.is_audio(fname):
+                # 音频/视频：不走文本抽取，经 ASR 转写成文字稿。
+                # 角色强制为 transcript——音频的内容就是转写稿，没有第二种解读。
+                # 失败走 errors 通道（和其它解析失败同一形态），不影响同批其它文件。
+                role = "transcript"
+                try:
+                    parsed = audio_ingest.transcribe_audio(fname, data)
+                except ParseError as e:
+                    errors.append("%s：%s" % (fname, e))
+                    continue
+                except Exception as e:
+                    errors.append("%s：转写异常 %s" % (fname, e))
+                    continue
+                parsed["kind"] = "asr-transcript"
+            else:
+                try:
+                    parsed = parse_bytes(fname, data)
+                except ParseError as e:
+                    errors.append("%s：%s" % (fname, e))
+                    continue
+                except Exception as e:
+                    errors.append("%s：解析异常 %s" % (fname, e))
+                    continue
             if not parsed.get("text"):
                 warn = "；".join(parsed.get("warnings") or []) or "抽不出文字"
                 errors.append("%s：%s" % (fname, warn))
@@ -496,6 +515,9 @@ def h_upload(ctx):
                 "filename": fname, "role": role, "kind": parsed.get("kind"),
                 "chars": len(parsed["text"]), "warnings": parsed.get("warnings") or [],
                 "text": parsed["text"], "data": data,
+                # ASR 的段级时间戳一起带下去——P1 说话人归属的最小单位就是段，
+                # 只存合并文本的话"谁在说"在数据层就不存在。
+                "segments": parsed.get("segments") or [],
             })
             by_role[role].append(parsed["text"])
             name = name or guess_name(fname)
@@ -941,6 +963,100 @@ def h_interview(ctx):
                          target_type="candidate", target_id=cand["id"],
                          detail={"questions": len(out["questions"])})
     return {"ok": True, "interview": out}
+
+
+# ---------------------------------------------------------------------------
+# 面试录音：说话人归属与问答配对（P1）
+# ---------------------------------------------------------------------------
+def _interview_questions(cand):
+    """从候选人记录取面试通知的问题清单（interview.py 的产出）。"""
+    iv = cand.get("interview")
+    if not isinstance(iv, dict):
+        return []
+    qs = iv.get("questions")
+    return qs if isinstance(qs, list) else []
+
+
+@route("POST", "/api/candidates/:cid/diarize", "candidate.write")
+def h_diarize(ctx):
+    import diarization
+    cand = store.get_candidate(ctx["params"]["cid"])
+    if not cand:
+        raise ApiError("候选人不存在", 404)
+    segs = store.get_segments(cand["id"])
+    if not segs:
+        # 没有 ASR 段：粘贴的转写稿切伪段（层 1 认得"面试官："前缀）。
+        text = (cand.get("transcript_text") or "").strip()
+        if not text:
+            raise ApiError("这位候选人没有面试转写稿——先上传录音或粘贴转写稿。", 400)
+        segs = diarization.segments_from_text(text)
+        if not segs:
+            raise ApiError("转写稿切不出任何段落（可能是空内容）。", 400)
+    try:
+        out = diarization.attribute(segs, questions=_interview_questions(cand),
+                                    api=_model_api(ctx))
+    except Exception as e:
+        # 模型失败如实上抛——不静默退回"全 unassigned"：
+        # 那会让覆盖率谎报成 0 而不是一次明确的失败。
+        raise ApiError("说话人归属失败：%s" % e, 502)
+    saved = store.save_segments(cand["id"], cand["job_id"], out["segments"])
+    if ctx["user"]:
+        conn = db.connect()
+        with db.tx(conn) as c:
+            audit.record(c, "interview.diarize", actor=ctx["user"]["id"],
+                         target_type="candidate", target_id=cand["id"],
+                         detail={"segments": saved["saved"],
+                                 "manual_kept": saved["manual_kept"],
+                                 "coverage": out["stats"]["coverage"]})
+    return {"ok": True, "segments": out["segments"], "stats": out["stats"],
+            "saved": saved}
+
+
+@route("GET", "/api/candidates/:cid/diarization", "candidate.read")
+def h_diarization(ctx):
+    import diarization
+    cand = store.get_candidate(ctx["params"]["cid"], with_text=False)
+    if not cand:
+        raise ApiError("候选人不存在", 404)
+    segs = store.get_segments(cand["id"])
+    return {"ok": True, "segments": segs,
+            "stats": diarization.stats_of(segs) if segs else None}
+
+
+@route("PUT", "/api/candidates/:cid/segments/:idx", "candidate.write")
+def h_segment_correct(ctx):
+    cand = store.get_candidate(ctx["params"]["cid"], with_text=False)
+    if not cand:
+        raise ApiError("候选人不存在", 404)
+    body = ctx["body"] or {}
+    try:
+        store.update_segment(cand["id"], ctx["params"]["idx"], body)
+    except ValueError as e:
+        raise ApiError(str(e), 400)
+    except KeyError:
+        raise ApiError("段不存在：idx=%s" % ctx["params"]["idx"], 404)
+    if ctx["user"]:
+        conn = db.connect()
+        with db.tx(conn) as c:
+            audit.record(c, "segment.correct", actor=ctx["user"]["id"],
+                         target_type="candidate", target_id=cand["id"],
+                         detail={"idx": ctx["params"]["idx"],
+                                 "speaker": (body.get("speaker") or "").strip(),
+                                 "asker": (body.get("asker") or "").strip()[:40]})
+    return {"ok": True}
+
+
+@route("GET", "/api/candidates/:cid/qa-pairing", "candidate.read")
+def h_qa_pairing(ctx):
+    import interview_analysis
+    cand = store.get_candidate(ctx["params"]["cid"], with_text=False)
+    if not cand:
+        raise ApiError("候选人不存在", 404)
+    segs = store.get_segments(cand["id"])
+    if not segs:
+        raise ApiError("还没有转写段——先上传录音并跑一次说话人归属。", 400)
+    out = interview_analysis.pair_qa(segs, cand.get("interview"))
+    return {"ok": True, "pairs": out["pairs"], "stats": out["stats"]}
 
 
 # ---------------------------------------------------------------------------

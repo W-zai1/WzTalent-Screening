@@ -42,7 +42,7 @@ check("备份成功", r1["ok"], r1.get("error"))
 check("完整性校验通过", r1["verified"], r1.get("error"))
 check("文件存在且非空", os.path.exists(r1["path"]) and r1["bytes"] > 0, r1["bytes"])
 check("统计到 5 个候选人", r1["stats"].get("candidates") == 5, r1["stats"])
-check("统计到 schema 版本 7", r1["stats"].get("schema_version") == 7, r1["stats"])
+check("统计到 schema 版本 8", r1["stats"].get("schema_version") == 8, r1["stats"])
 check("提示备份含明文敏感数据", "明文姓名" in r1["warning"], r1["warning"])
 
 print("\n--- 2. WAL 一致性：备份里有最新写入 ---")

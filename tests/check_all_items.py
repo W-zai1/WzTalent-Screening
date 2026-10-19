@@ -213,7 +213,7 @@ item("M-31", "流式失败兜底与开关",
 
 # ---------------------------------------------------------------- 健壮性整改
 item("R-32", "温度必须显式传（禁止靠默认值恰好相等）",
-     has("engine/agents.py", r"stream=False, temperature, \*\*kw"),
+     has("engine/agents.py", r"stream=False, temperature,"),
      "_agent_turn 的 temperature 是必填关键字参数；另有 AST 检查盯住新增调用点")
 
 item("R-33", "提示词常量不被内联复制",
@@ -258,6 +258,37 @@ item("R-40", "演示数据显式注入（不内置）",
 item("R-41", "批量身份确认（部分成功照实返回）",
      has("engine/api.py", r"/api/identity/batch-confirm", r"IDENTITY_BATCH_MAX"),
      "只支持确认「不是同一人」；合并必须逐条；超限拒绝而非静默截断")
+
+# ---------------------------------------------------------------- 可观测与验收
+item("O-42", "事件按 candidate_id 关联（同名不串台）",
+     has("engine/agents.py", r"candidate_id.*candidate_id|cand_id=cand_id") and
+     any_of("viewer/app.js", r"ev\.candidate_id \|\|"),
+     "agent 事件带 candidate_id；前端气泡键按 ID，旧事件回退姓名")
+
+item("O-43", "事件归一化字段 stage/duration_ms/error_type",
+     has("engine/events.py", r"def stage_of", r"def classify_error",
+         r"def annotate") and
+     any_of("engine/runs.py", r"events\.annotate"),
+     "不改原有 type，附加归一化字段；落库事件重放也带；认不出的阶段返回 None")
+
+item("O-44", "合成样本集 + 人工预期（可自检）",
+     os.path.exists(os.path.join(ROOT, "tests/fixtures/sample_set_v1.json")) and
+     has("engine/sampleset.py", r"def check", r"def expand"),
+     "8 类样本各自声明该支持/该判缺失/不该得出的结论；自检保证预期与原文对得上")
+
+item("O-45", "超长材料按头尾保留截断（不因排版误判）",
+     has("engine/context.py", r"def _truncate_head_tail", r"TRUNC_HEAD_RATIO"),
+     "原来只砍尾巴，写在末尾的关键经历会被静默丢掉；现头 60% 尾 40% 并显式标注")
+
+item("O-46", "样本评测入口（环境未就绪时拒绝给通过率）",
+     os.path.exists(os.path.join(ROOT, "tools/eval_samples.py")) and
+     any_of("tools/eval_samples.py", r"环境未就绪", r"env_fail"),
+     "真调模型才能回答'准不准'；没配凭证时报环境问题而不是打 0% 通过率")
+
+item("O-47", "截断信息区分「整段未装入」与「只读了头尾」",
+     has("engine/agents.py", r"truncated_sections") and
+     any_of("viewer/app.js", r"保留了头尾"),
+     "混在一起会让人以为材料完全没读，而实际是读了头尾的")
 
 # ---------------------------------------------------------------- 输出
 print("=" * 72)

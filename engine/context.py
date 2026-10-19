@@ -42,6 +42,31 @@ def _estimate_tokens(text):
     return int(len(text or "") / CHARS_PER_TOKEN)
 
 
+# 截断时头部与尾部的保留比例。60/40 的理由：
+# 简历头部通常是姓名/学历/技能概要（准入判断要用），
+# 尾部常常是最近一段经历或补充说明（能力判断要用），
+# 中间最容易是重复的项目流水账。
+TRUNC_HEAD_RATIO = 0.6
+
+
+def _truncate_head_tail(text, room):
+    """把超长文本压到 room 字以内，保留头尾、省略中间。
+
+    只砍尾巴会让"关键信息写在末尾"的简历被系统性低估——
+    评分结果就取决于候选人的排版习惯，这不合理。
+    """
+    text = text or ""
+    if len(text) <= room:
+        return text
+    marker = "\n…（材料此处过长，中段已省略）\n"
+    avail = max(0, room - len(marker))
+    if avail <= 0:
+        return text[:max(0, room)]
+    head = int(avail * TRUNC_HEAD_RATIO)
+    tail = avail - head
+    return text[:head] + marker + (text[-tail:] if tail > 0 else "")
+
+
 class ContextStore:
     """候选人的结构化原始上下文（含岗位 JD，匹配度锚点）。"""
 
@@ -97,13 +122,12 @@ class ContextStore:
         """
         return any((self.sections.get(k) or "").strip() for k in SECTION_LABELS)
 
-    def shared_facts_text(self) -> str:
-        """同一份原始事实，供所有 agent 消费（对抗公平：不裁剪、不偏向）。"""
+    def header_text(self) -> str:
+        """姓名 + 岗位 + JD：这些是匹配锚点，不参与裁剪，但要占预算。"""
         lines = [
             f"姓名：{self.meta.get('name','')}",
             f"应聘岗位：{self.meta.get('position','')}",
         ]
-        # —— 岗位 JD：匹配度锚点，所有 agent 共享 ——
         if self.job:
             if self.job.get("title"):
                 lines.append(f"【应聘岗位JD】{self.job.get('title')}")
@@ -111,6 +135,11 @@ class ContextStore:
                 vals = self.job.get(key)
                 if vals:
                     lines.append(f"【{lab}】" + "；".join(vals))
+        return "\n".join(lines)
+
+    def shared_facts_text(self) -> str:
+        """同一份原始事实，供所有 agent 消费（对抗公平：不裁剪、不偏向）。"""
+        lines = [self.header_text()]
         for key, lab in SECTION_LABELS.items():
             val = self.sections.get(key, "")
             if val:
@@ -148,19 +177,34 @@ class ContextStore:
         并把"截掉了哪些 section、截掉多少字"写进返回值和结果里。
         这样至少**评审结论的适用边界是已知的**，而不是假的。
 
+        **单份材料内部按"首尾保留"截断，而不是只砍尾部。**
+        踩过的坑：原来是从前往后装、装不下就砍尾巴。但简历末尾常常放着
+        最近一段工作经历或补充说明（"补充：最近在 X 负责接入层，日均 1.5 亿请求"），
+        而中间是项目流水账。于是"关键经历写在哪"直接决定了它会不会被看到——
+        评分结果取决于候选人的排版习惯，这是不该发生的事。
+        现在头部保留 60%、尾部保留 40%，中间省略并显式标注。
+
         JD 与 section 标签不计入裁剪（它们很短，且是匹配锚点）。
         """
         budget = int(budget or TOKEN_BUDGET)
         info = {"budget_tokens": budget, "original_tokens": self.estimate_tokens(),
                 "truncated": False, "dropped_sections": [],
-                "dropped_chars": 0, "kept_sections": []}
+                "dropped_chars": 0, "kept_sections": [],
+                "truncated_sections": []}
         if info["original_tokens"] <= budget:
             info["kept_sections"] = [k for k, v in self.sections.items() if (v or "").strip()]
             info["final_tokens"] = info["original_tokens"]
             return info
 
         # 逐 section 装填，保留顺序（简历/评估/转录的顺序有意义）
-        char_budget = int(budget * 1.5)
+        # 可用字数要扣掉 JD 部分的长度：estimate_tokens() 统计的是
+        # shared_facts_text()（含 JD），JD 不参与裁剪但占预算。
+        # 不扣的话会出现"每个 section 都没超，但合起来超预算"——
+        # 预算守卫自己超预算，那就成了笑话。
+        jd_chars = len(self.header_text() or "")
+        # 再留一点给 section 标签（【简历】）与换行符，
+        # 否则会出现"每个 section 都没超、合起来却超几个 token"的尴尬。
+        char_budget = max(400, int(budget * 1.5) - jd_chars - 120)
         used = 0
         for key, lab in SECTION_LABELS.items():
             val = (self.sections.get(key) or "").strip()
@@ -177,10 +221,10 @@ class ContextStore:
                 used += len(val)
                 info["kept_sections"].append(lab)
             else:
-                cut = val[:max(0, room - 40)]
+                self.sections[key] = _truncate_head_tail(val, room)
                 info["dropped_sections"].append(lab)
-                info["dropped_chars"] += len(val) - len(cut)
-                self.sections[key] = cut + "\n…（材料超长，此处已截断）"
+                info["truncated_sections"].append(lab)
+                info["dropped_chars"] += len(val) - len(self.sections[key])
                 used += len(self.sections[key])
                 info["truncated"] = True
 

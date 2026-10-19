@@ -727,9 +727,9 @@
         <div id="upDrop" class="drop-zone">
           <div class="drop-ico">⬆</div>
           <div>把文件拖到这里，或 <span class="link" onclick="document.getElementById('upFiles').click()">点击选择</span></div>
-          <div class="hint">文件名带「测评/assessment」会自动归为测评，其余视为简历</div>
+          <div class="hint">文件名带「测评/assessment」自动归为测评、「录音/面试」归为转写，其余视为简历；录音需配置 ASR 引擎（见 README）</div>
         </div>
-        <input type="file" id="upFiles" multiple accept=".docx,.pdf,.txt,.md,.json,.png,.jpg,.jpeg,.webp" class="hidden" onchange="onUpFilesPicked(this)">
+        <input type="file" id="upFiles" multiple accept=".docx,.pdf,.txt,.md,.json,.png,.jpg,.jpeg,.webp,.mp3,.wav,.m4a,.mp4,.ogg,.webm" class="hidden" onchange="onUpFilesPicked(this)">
         <div id="upFilesList" class="file-list"></div>
       </div>
       <div class="modal-actions">

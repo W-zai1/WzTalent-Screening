@@ -41,6 +41,10 @@ ACTIONS = (
     "talent.update", "talent.import", "talent.delete",
     "outcome.record", "outcome.delete",
     "interview.generate",
+    # 面试录音分析（P1）：归属一次运行（含保留了哪几条人工修正）、
+    # 以及逐段人工修正。修正改的是"谁在说"——错了会污染整场分析，
+    # 必须能查到是谁在什么时候把哪一段从什么改成了什么。
+    "interview.diarize", "segment.correct",
     "calibration.record",
     # 回测对齐：把"HR 的真实决定"作为标准答案导入，以及基于它做的决策。
     # 单独登记动作，是为了出事时能一条查询捞全"谁在什么依据下推/拒了谁"。

@@ -35,7 +35,7 @@ PROJECT_ROOT = os.path.dirname(ROOT)
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "talent.db")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _local = threading.local()
 _init_lock = threading.Lock()
@@ -580,6 +580,51 @@ def _m7_evaluations(conn):
              int(((res.get("uncertainty") or {}).get("repeats_ok")) or 1),
              (res.get("uncertainty") or {}).get("stdev"),
              r["result_json"], r["updated_at"] or now_iso()))
+
+
+@_migration(8)
+def _m8_interview_segments(conn):
+    """面试转写稿的**段级说话人归属**：谁在说、哪句是提问、问的人是谁。
+
+    为什么必须补
+    ------------
+    P0 落地音频上传后，`candidates.transcript_enc` 里只有一坨合并纯文本——
+    没有时间戳、没有分段，"面试官问了什么、候选人答了什么"这件事在数据层
+    就不存在。问答配对、主张核对（口头 vs 简历 vs 笔记）全都无从谈起。
+
+    设计取舍
+    --------
+    · 一段一行（`idx` 为段序）：ASR 的段级时间戳是天然分段，粘贴的转写稿
+      按行/句切伪段——归属的最小单位必须是"一句话"，不能是"一整篇"。
+    · `speaker` 三态：interviewer / candidate / unassigned。
+      **unassigned 是一等公民**：任何一层不确定就落这一态，不喂给分析层。
+      猜错归属比不评危险得多（会把 A 的回答算到 B 头上且无人察觉）。
+    · `source` 区分 engine/manual：重跑归属不覆盖人工修正（层 3 终审），
+      按 `idx` 对齐保留——人工修正是标注数据，比模型输出贵。
+    · `asker` 面试官身份尽力为准：低置信留空，记错提问人污染的是评估者
+      元数据，不影响对候选人的判断，所以不为主流程设阻断。
+    · 随候选人 CASCADE 删除；**不随 erase_person 删文件**（音频文件删除
+      是 P3 的已知缺口，见设计文档 §6）。
+    """
+    exec_script(conn, """
+    CREATE TABLE interview_segments (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+        job_id       TEXT NOT NULL,
+        idx          INTEGER NOT NULL,
+        start_sec    REAL NOT NULL DEFAULT 0,
+        end_sec      REAL NOT NULL DEFAULT 0,
+        text         TEXT NOT NULL DEFAULT '',
+        speaker      TEXT NOT NULL DEFAULT 'unassigned',
+        confidence   REAL NOT NULL DEFAULT 0,
+        reason       TEXT NOT NULL DEFAULT '',
+        asker        TEXT NOT NULL DEFAULT '',
+        source       TEXT NOT NULL DEFAULT 'engine',
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    );
+    CREATE INDEX idx_segs_cand ON interview_segments(candidate_id, idx);
+    """)
 
 
 # ---------------------------------------------------------------------------

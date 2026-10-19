@@ -362,6 +362,7 @@ def add_candidate(job_id, name, files=None, resume_text="", assessment_text="",
 
     files = files or []
     # 素材合并（可能一个是 .docx 简历、一个是 .pdf 测评）
+    segs = []          # 音频/转写稿带来的段级时间戳（说话人归属的地基）
     for f in files:
         role = f.get("role") or "resume"
         txt = f.get("text") or ""
@@ -371,6 +372,9 @@ def add_candidate(job_id, name, files=None, resume_text="", assessment_text="",
             assessment_text = (assessment_text + "\n\n" + txt).strip()
         elif role == "transcript":
             transcript_text = (transcript_text + "\n\n" + txt).strip()
+            # 粘贴的转写稿没有段；音频经 ASR 才有。两类可以同批，
+            # 段只覆盖音频部分——归属时整体重切，见 diarization。
+            segs.extend(f.get("segments") or [])
         else:
             resume_text = (resume_text + "\n\n" + txt).strip()
 
@@ -433,6 +437,7 @@ def add_candidate(job_id, name, files=None, resume_text="", assessment_text="",
                  db.jdump(f.get("warnings") or []), 1 if f.get("imported_from") else 0, now),
             )
         _record_identity(c, person_id, cid, decision, decide=decide, actor=actor)
+        _insert_segments(c, cid, job_id, segs, now)
         audit.record(c, "candidate.upload", actor=actor, target_type="candidate", target_id=cid,
                      detail={"job_id": job_id, "files": len(files),
                              "identity_verdict": decision.get("verdict")})
@@ -686,6 +691,157 @@ def delete_candidate(cand_id, actor="system"):
     d = os.path.join(job_dir(job_id), "files", cand_id)
     if os.path.isdir(d):
         shutil.rmtree(d, ignore_errors=True)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 面试转写稿的段级说话人归属（P1，diarization 的数据落地）
+# ---------------------------------------------------------------------------
+def _seg_row(r):
+    return {
+        "idx": r["idx"],
+        "start": r["start_sec"],
+        "end": r["end_sec"],
+        "text": r["text"],
+        "speaker": r["speaker"],
+        "confidence": r["confidence"],
+        "reason": r["reason"],
+        "asker": r["asker"],
+        "source": r["source"],
+        "updated_at": r["updated_at"],
+    }
+
+
+def _insert_segments(c, cand_id, job_id, segs, now):
+    """在既有事务里插段（add_candidate 用，保证候选人与段同事务）。
+
+    段序按传入顺序重排（`idx` = 位置）：多份音频/多份转写稿拼起来时，
+    "第几段"必须是全局唯一且连续的，否则人工修正按 idx 对齐会错位。
+    """
+    n = 0
+    for i, s in enumerate(segs or []):
+        if not isinstance(s, dict):
+            continue
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        c.execute(
+            "INSERT INTO interview_segments(candidate_id, job_id, idx, start_sec, end_sec,"
+            " text, speaker, confidence, reason, asker, source, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (cand_id, job_id, i,
+             float(s.get("start") or s.get("start_sec") or 0.0),
+             float(s.get("end") or s.get("end_sec") or 0.0),
+             text, s.get("speaker") or "unassigned",
+             float(s.get("confidence") or 0.0),
+             (s.get("reason") or "")[:300], (s.get("asker") or "")[:40],
+             s.get("source") or "engine", now, now))
+        n += 1
+    return n
+
+
+def save_segments(cand_id, job_id, segments, keep_manual=True):
+    """替换保存某候选人的转写段（engine 归属的一次运行结果）。
+
+    `keep_manual=True`（默认）时按 idx 保留**不可重算**的段：
+    source=manual（人工修正）与 source=prefix（原文自带前缀推定的
+    归属——切段时前缀已剥离，无法重建）。重跑归属不该冲掉它们，
+    那是比模型输出贵得多的数据。代价是换了一份 segmentation 不同的
+    录音重传时，旧修正可能错位；所以修正记录里带 updated_at，
+    UI 需要时能看出"这条修正是针对哪一版分段"。
+
+    返回 {"saved": n, "manual_kept": m}（manual_kept 含 prefix 段——
+    两者都是"非引擎"来源，对调用方是同一类：不许覆盖）。
+    """
+    db.init()
+    conn = db.connect()
+    cand = get_candidate(cand_id, with_text=False)
+    if not cand:
+        raise KeyError("候选人不存在：%s" % cand_id)
+    job_id = job_id or cand["job_id"]
+    now = _now()
+
+    rows = []
+    for i, s in enumerate(segments or []):
+        if not isinstance(s, dict):
+            continue
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        rows.append((i,
+                     float(s.get("start") or s.get("start_sec") or 0.0),
+                     float(s.get("end") or s.get("end_sec") or 0.0),
+                     text, s.get("speaker") or "unassigned",
+                     float(s.get("confidence") or 0.0),
+                     (s.get("reason") or "")[:300], (s.get("asker") or "")[:40],
+                     s.get("source") or "engine"))
+
+    with db.tx(conn) as c:
+        keep = {}
+        if keep_manual:
+            for r in c.execute(
+                    "SELECT idx, speaker, asker, reason, confidence, source, updated_at"
+                    " FROM interview_segments WHERE candidate_id=?"
+                    " AND source IN ('manual','prefix')",
+                    (cand_id,)):
+                keep[r["idx"]] = dict(r)
+        c.execute("DELETE FROM interview_segments WHERE candidate_id=?", (cand_id,))
+        kept = 0
+        for (idx, st, en, text, speaker, conf, reason, asker, source) in rows:
+            m = keep.get(idx)
+            if m:
+                speaker, asker, reason, source = (m["speaker"], m["asker"],
+                                                  m["reason"], m["source"])
+                conf, upd = m["confidence"], m["updated_at"]
+                kept += 1
+            else:
+                upd = now
+            c.execute(
+                "INSERT INTO interview_segments(candidate_id, job_id, idx, start_sec, end_sec,"
+                " text, speaker, confidence, reason, asker, source, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cand_id, job_id, idx, st, en, text, speaker, conf, reason, asker,
+                 source, now, upd))
+    return {"saved": len(rows), "manual_kept": kept}
+
+
+def get_segments(cand_id):
+    """取某候选人的全部段（按 idx）。没有返回空列表——调用方据此决定
+    是把粘贴的转写稿切伪段还是直接报"没有转写稿"。"""
+    db.init()
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT * FROM interview_segments WHERE candidate_id=? ORDER BY idx",
+        (cand_id,)).fetchall()
+    return [_seg_row(r) for r in rows]
+
+
+def update_segment(cand_id, idx, patch):
+    """人工修正一段的归属（层 3 终审）。只允许 speaker/asker。
+
+    speaker 允许 unassigned——UI 必须能表达"这段我也不确定"，
+    把不确定态藏起来只会逼用户猜。confidence 置 1.0：人看过了。
+    """
+    db.init()
+    conn = db.connect()
+    cand = get_candidate(cand_id, with_text=False)
+    if not cand:
+        raise KeyError("候选人不存在：%s" % cand_id)
+    speaker = (patch.get("speaker") or "").strip()
+    if speaker not in ("interviewer", "candidate", "unassigned"):
+        raise ValueError("speaker 必须是 interviewer / candidate / unassigned")
+    asker = (patch.get("asker") or "").strip()[:40]
+    reason = (patch.get("reason") or "").strip()[:200] or "人工修正"
+    now = _now()
+    with db.tx(conn) as c:
+        cur = c.execute("SELECT id FROM interview_segments WHERE candidate_id=? AND idx=?",
+                        (cand_id, int(idx))).fetchone()
+        if not cur:
+            raise KeyError("段不存在：idx=%s" % idx)
+        c.execute(
+            "UPDATE interview_segments SET speaker=?, asker=?, reason=?, source='manual',"
+            " confidence=1.0, updated_at=? WHERE id=?",
+            (speaker, asker, reason, now, cur["id"]))
     return True
 
 

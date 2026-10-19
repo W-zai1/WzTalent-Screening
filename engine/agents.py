@@ -338,7 +338,7 @@ def _emit(on_event, ev):
 
 
 def _agent_turn(on_event, cand_name, key, label, role, messages, *,
-                stream=False, temperature, **kw):
+                stream=False, temperature, cand_id=None, **kw):
     """跑一次 agent 发言，并在开始/结束时各广播一个事件。
 
     `temperature` 是**必填的关键字参数**，故意不给默认值。
@@ -359,18 +359,23 @@ def _agent_turn(on_event, cand_name, key, label, role, messages, *,
     同时把记账上下文（role/candidate_id）塞进 llm_client，
     这样每次调用的用量能归到具体的 agent 角色上——成本报表才解释得通
     "钱花在辩论还是打分上"。
+
+    `cand_id` 必须一路带进事件里：同名候选人在同一个岗位下是真实存在的
+    （`identity` 模块专门处理这件事，`align` 报告层甚至拒绝按姓名回退匹配）。
+    事件如果只带姓名，并发评审时两个「张伟」的气泡就会互相覆盖——
+    存储层按 ID，展示层却按名字，这是自相矛盾的。
     """
     ctx = kw.pop("_ctx", {}) or {}
     llm_client.set_context(role=key, **ctx)
-    _emit(on_event, {"type": "agent_start", "candidate": cand_name,
-                     "key": key, "label": label, "role": role})
+    _base = {"candidate": cand_name, "candidate_id": cand_id or "",
+             "key": key, "label": label, "role": role}
+    _emit(on_event, dict(_base, type="agent_start"))
 
     on_delta = None
     if stream and on_event:
         def on_delta(piece):
-            _emit(on_event, {"type": "agent_delta", "candidate": cand_name,
-                             "key": key, "label": label, "role": role,
-                             "text": piece, "ephemeral": True})
+            _emit(on_event, dict(_base, type="agent_delta",
+                                 text=piece, ephemeral=True))
     try:
         if on_delta is not None:
             out = llm_client.complete_stream(messages, on_delta=on_delta,
@@ -380,11 +385,10 @@ def _agent_turn(on_event, cand_name, key, label, role, messages, *,
     finally:
         llm_client.clear_context()
     text = out["text"]
-    _emit(on_event, {"type": "agent_message", "candidate": cand_name,
-                     "key": key, "label": label, "role": role, "text": text,
-                     "tokens": (out.get("usage") or {}).get("total_tokens"),
-                     "streamed": bool(out.get("streamed")),
-                     "latency_ms": out.get("latency_ms")})
+    _emit(on_event, dict(_base, type="agent_message", text=text,
+                         tokens=(out.get("usage") or {}).get("total_tokens"),
+                         streamed=bool(out.get("streamed")),
+                         latency_ms=out.get("latency_ms")))
     return text
 
 
@@ -575,14 +579,14 @@ def _run_once(c, job=None, api=None, on_event=None, parallel_judges=True):
     pro = _agent_turn(on_event, cand_name, "pro_open", "正方立论（主张录用）", "pro", [
         {"role": "system", "content": _PROMPT_PRO_OPEN},
         {"role": "user", "content": facts},
-    ], stream=True, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
+    ], stream=True, cand_id=cand_id, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
     mem.pro = pro
 
     # ② 反方立论（主张淘汰）—— 同样看共享事实（对抗公平）
     con = _agent_turn(on_event, cand_name, "con_open", "反方立论（主张淘汰）", "con", [
         {"role": "system", "content": _PROMPT_CON_OPEN},
         {"role": "user", "content": facts},
-    ], stream=True, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
+    ], stream=True, cand_id=cand_id, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
     mem.con = con
 
     # ③④ 互否回合（限制 DEBATE_ROUNDS 轮，防无限拉扯）
@@ -597,7 +601,7 @@ def _run_once(c, job=None, api=None, on_event=None, parallel_judges=True):
                                 f"正方驳斥（第 {r+1} 轮）", "pro", [
             {"role": "system", "content": _PROMPT_PRO_REBUT},
             {"role": "user", "content": f"{facts}\n\n当前辩论全貌：\n{hist}\n\n请继续驳斥反方（第{r+1}轮）。"},
-        ], stream=True, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
+        ], stream=True, cand_id=cand_id, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
         mem.rounds.append({"pro": pro_rebut, "con": ""})
         con_rebut = _agent_turn(on_event, cand_name, f"con_rebut_{r+1}",
                                 f"反方驳斥（第 {r+1} 轮）", "con", [
@@ -606,7 +610,7 @@ def _run_once(c, job=None, api=None, on_event=None, parallel_judges=True):
             # 版本号看起来变了却什么也没变（或反过来）。现在直接引用常量。
             {"role": "system", "content": _PROMPT_CON_REBUT},
             {"role": "user", "content": f"{facts}\n\n当前辩论全貌：\n{hist}\n\n请继续驳斥正方（第{r+1}轮）。"},
-        ], stream=True, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
+        ], stream=True, cand_id=cand_id, _ctx=ctx, **api, temperature=DEBATE_TEMPERATURE)
         mem.rounds[-1]["con"] = con_rebut
 
     # 裁判与评委看到的必须是**同一份**历史（同一预算、同一截断点）
@@ -619,7 +623,7 @@ def _run_once(c, job=None, api=None, on_event=None, parallel_judges=True):
         {"role": "system", "content": _PROMPT_ADJUDICATOR},
         {"role": "user", "content": (f"{facts}\n\n{hist_final}"
                                      + (("\n\n" + criteria_block) if criteria_block else ""))},
-    ], json_mode=True, _ctx=ctx, **api, temperature=0.0)
+    ], json_mode=True, cand_id=cand_id, _ctx=ctx, **api, temperature=0.0)
     adj = _parse_adjudication(raw_adj)
     adj_text = _adjudication_text(adj)
     _emit(on_event, {"type": "adjudication", "candidate": cand_name,
@@ -639,7 +643,7 @@ def _run_once(c, job=None, api=None, on_event=None, parallel_judges=True):
             {"role": "system", "content": render_judge_prompt(
                 i, persona_name, persona_rule, criteria_block)},
             {"role": "user", "content": pkg},
-        ], json_mode=True, _ctx=ctx, **api,
+        ], json_mode=True, cand_id=cand_id, _ctx=ctx, **api,
             # 打分必须可复现：temperature=0 让"同一份输入"真的存在。
             # 原来默认 0.7，导致同一份简历今天 8.2 明天 7.6，
             # 而这种波动在数据上和"真实差异"长得一模一样。
@@ -701,6 +705,10 @@ def _run_once(c, job=None, api=None, on_event=None, parallel_judges=True):
                 "original_tokens": budget_info["original_tokens"],
                 "final_tokens": budget_info["final_tokens"],
                 "dropped_sections": budget_info["dropped_sections"],
+                # 整段丢弃 与 单份材料内部截断 要分开记：
+                # 前者是"这份材料没看到"，后者是"看到了头尾、中间省略"。
+                # 混在一起会让人以为材料完全没读，而实际是读了头尾的。
+                "truncated_sections": budget_info.get("truncated_sections") or [],
                 "dropped_chars": budget_info["dropped_chars"],
             },
             # 辩论历史同样有预算。不记下来的话，"评委只看到 3 段辩论"

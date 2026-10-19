@@ -16,6 +16,8 @@ import re
 import glob
 import json
 
+from docparse import AUDIO_EXTS  # 音频/视频扩展名与 docparse、api 共用一份名单
+
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "..", "skills")
 
 
@@ -50,9 +52,9 @@ def build_candidates_from_dir(inputs_dir, job):
         stem, ext = os.path.splitext(base)
         if "__" in stem:
             name, rest = stem.split("__", 1)
-            # 去掉文件名中附带的 .resume/.assessment/.transcript 类型标记，还原真实岗位名
+            # 去掉文件名中附带的类型标记，还原真实岗位名
             # 例：林晚__高级后端工程师.resume.md -> name=林晚, position=高级后端工程师
-            position = re.sub(r"\.(resume|assessment|transcript)(?=\.|$)", "", rest)
+            position = re.sub(r"\.(resume|assessment|transcript|audio|video)(?=\.|$)", "", rest)
         else:
             name, position = stem, ""
         b = buckets.setdefault(name, {"position": position})
@@ -74,8 +76,13 @@ def build_candidates_from_dir(inputs_dir, job):
                     b["interview_transcript"] = _read(path)
             else:
                 b["interview_transcript"] = _read(path)
-        elif ext.lower() in (".mp3", ".wav", ".m4a", ".ogg") and asr and hasattr(asr, "transcribe"):
-            out = asr.transcribe(path)
+        elif ext.lower() in AUDIO_EXTS and asr and hasattr(asr, "transcribe"):
+            try:
+                out = asr.transcribe(path)
+            except Exception as e:
+                # 转写失败（未装 faster-whisper / 引擎未配置 / 空结果）必须显式失败：
+                # 假转写稿会污染整场评审，宁可在这里停下。
+                raise SystemExit("[ingest] %s 转写失败：%s" % (base, e))
             b["interview_transcript"] = out.get("text", "") if isinstance(out, dict) else str(out)
 
     candidates = []
